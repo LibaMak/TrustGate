@@ -1,0 +1,41 @@
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Local audit database & real-data artifacts
+*.db
+*.sqlite
+*.sqlite3
+trustgate_audit.db
+uploads/
+real_data/
+exports/
+results/real_*
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Generated test / sample / demo artifacts & dev scripts
+sample_docs/
+test_docs/
+tests/
+demo/*.pdf
+demo/*.docx
+demo/*.html
+scripts/
