@@ -37,6 +37,8 @@ class QuarantinedItem:
     reason: str
     framework_tags: list[str] = field(default_factory=list)
     masked_snippet: str = ""
+    finding_type: str = "prompt_injection"
+    action: str = "removed"
 
 
 @dataclass
@@ -55,6 +57,27 @@ class DocumentScanSummary:
     reason: str = ""
     removed_items_count: int = 0
     removed_texts_summary: list[str] = field(default_factory=list)
+    content_removed_pct: float = 0.0
+    content_kept_pct: float = 100.0
+    flagged_pct: float = 0.0
+    sensitive_items_masked: int = 0
+    pii_masked_by_type: dict[str, int] = field(default_factory=dict)
+    upload_status_line: str = ""
+
+
+_PII_DISPLAY_LABELS: dict[str, str] = {
+    "CNIC": "CNIC",
+    "CARD": "card",
+    "PASSWORD": "password",
+    "API_KEY": "API key",
+}
+
+
+def _format_pii_breakdown(counts: dict[str, int]) -> str:
+    if not counts:
+        return ""
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{name} {cnt}" for name, cnt in ordered)
 
 
 _HIGH_RISK_QUERY_RE = re.compile(
@@ -232,6 +255,7 @@ class TrustGateShield:
         doc_format = _normalize_format(source, first_meta.get("file_type"))
 
         if not self.enabled:
+            total_chars = sum(len(getattr(c, "text", "") or "") for c in chunks)
             if self.audit_logger is not None:
                 for chunk in chunks:
                     loc = (chunk.metadata or {}).get("location", chunk.chunk_id)
@@ -243,6 +267,17 @@ class TrustGateShield:
                         action="bypassed",
                         pii_masked_count=0,
                     )
+                self.audit_logger.log_document_scan(
+                    source=source,
+                    file_format=doc_format,
+                    total_chars=total_chars,
+                    removed_chars=0,
+                    removed_pct=0.0,
+                    flagged_pct=0.0,
+                    policy_action="bypassed",
+                    sensitive_items_masked=0,
+                    pii_breakdown={},
+                )
             return DocumentScanSummary(
                 source=source,
                 total_chunks=len(chunks),
@@ -253,6 +288,12 @@ class TrustGateShield:
                 max_risk_score=0,
                 kept_chunks=list(chunks),
                 reason="Shield disabled (OFF).",
+                content_removed_pct=0.0,
+                content_kept_pct=100.0,
+                flagged_pct=0.0,
+                sensitive_items_masked=0,
+                pii_masked_by_type={},
+                upload_status_line="Shield OFF: 100% content kept | 0 sensitive items masked",
             )
 
         total = len(chunks)
@@ -314,12 +355,15 @@ class TrustGateShield:
             else:
                 clean_chunks.append((chunk, location, result.risk_score))
 
+        total_chars = sum(len(getattr(c, "text", "") or "") for c in chunks)
         suspicious_ratio = suspicious_count / total
+        flagged_pct = round(suspicious_ratio * 100, 1)
 
         # Strict block ONLY when total chunks >= 5 AND > 30% of chunks are suspicious
         if total >= self.min_chunks_for_strict_block and suspicious_ratio > self.strict_threshold:
             for chunk, location, result in flagged_chunks:
                 if result.action == "quarantine":
+                    ftype = "prompt_injection" if result.has_injection else "hidden_text"
                     quarantined_items.append(
                         QuarantinedItem(
                             chunk_id=chunk.chunk_id,
@@ -329,15 +373,13 @@ class TrustGateShield:
                             reason="; ".join(f.detail for f in result.findings),
                             framework_tags=result.framework_tags,
                             masked_snippet=make_masked_snippet(chunk.text),
+                            finding_type=ftype,
+                            action="strict_block",
                         )
                     )
             all_categories.add("strict_block")
             tags = get_framework_tags(sorted(all_categories))
-            reason = (
-                f"Strict Block: {suspicious_count}/{total} chunks ({suspicious_ratio:.0%}) "
-                f"exceeded the {self.strict_threshold:.0%} threshold (>= {self.min_chunks_for_strict_block} chunks); "
-                "entire document rejected."
-            )
+            reason = f"{flagged_pct:.0f}% of the document content was flagged; entire document blocked."
             if self.audit_logger is not None:
                 for chunk, loc, res in flagged_chunks:
                     self.audit_logger.log_chunk_scan(
@@ -355,6 +397,17 @@ class TrustGateShield:
                         risk_score=rscore,
                         action="blocked",
                     )
+                self.audit_logger.log_document_scan(
+                    source=source,
+                    file_format=doc_format,
+                    total_chars=total_chars,
+                    removed_chars=total_chars,
+                    removed_pct=100.0,
+                    flagged_pct=flagged_pct,
+                    policy_action="strict_block",
+                    sensitive_items_masked=0,
+                    pii_breakdown={},
+                )
             self._log_if_enabled(
                 event_type="strict_block",
                 source=source,
@@ -382,6 +435,12 @@ class TrustGateShield:
                 framework_tags=tags,
                 reason=reason,
                 removed_items_count=len(flagged_chunks),
+                content_removed_pct=100.0,
+                content_kept_pct=0.0,
+                flagged_pct=flagged_pct,
+                sensitive_items_masked=0,
+                pii_masked_by_type={},
+                upload_status_line=f"Blocked: 0% content kept ({flagged_pct:.0f}% flagged) | 0 sensitive items masked",
             )
 
         # Sentence/line-level sanitization for flagged chunks (preserves clean remainder)
@@ -389,15 +448,22 @@ class TrustGateShield:
         total_hidden_removed = 0
         total_plain_removed = 0
         removed_snippets: list[str] = []
+        removed_chars = 0
 
         for chunk, location, result in flagged_chunks:
             clean_chunk, removed_parts, hidden_cnt, plain_cnt = _sanitize_flagged_chunk(chunk)
             total_hidden_removed += hidden_cnt
             total_plain_removed += plain_cnt
+            raw_len = len(getattr(chunk, "text", "") or "")
+            kept_len = len(getattr(clean_chunk, "text", "") or "") if clean_chunk is not None else 0
+            parts_len = sum(len(p) for p in removed_parts)
+            removed_chars += max(raw_len - kept_len, parts_len)
+
             removed_preview = make_masked_snippet(" | ".join(removed_parts) if removed_parts else chunk.text)
             removed_snippets.append(removed_preview)
 
             finding_reason = "; ".join(f.detail for f in result.findings) or "Suspicious content removed."
+            ftype = "prompt_injection" if result.has_injection else "hidden_text"
             quarantined_items.append(
                 QuarantinedItem(
                     chunk_id=chunk.chunk_id,
@@ -407,6 +473,8 @@ class TrustGateShield:
                     reason=finding_reason,
                     framework_tags=result.framework_tags,
                     masked_snippet=removed_preview,
+                    finding_type=ftype,
+                    action="removed",
                 )
             )
             if self.audit_logger is not None:
@@ -420,17 +488,26 @@ class TrustGateShield:
             if clean_chunk is not None:
                 chunks_to_keep.append((clean_chunk, location, 0))
 
-        # Preserve original chunk order
+        # Preserve original ordering
         chunks_to_keep.sort(key=lambda entry: getattr(entry[0], "index", 0))
 
-        # Mask high-risk PII in kept chunks before indexing/LLM
+        # Mask high-risk PII in kept text before indexing/LLM (PII is masked, never removed)
         sanitized_kept: list[Any] = []
+        pii_masked_by_type: dict[str, int] = {}
+        sensitive_items_masked = 0
+
         for chunk, loc, rscore in chunks_to_keep:
             masked_text, pii_findings = mask_high_risk_pii(chunk.text)
             cloned = copy.copy(chunk)
             cloned.text = masked_text
             cloned.metadata = dict(chunk.metadata or {})
             high_pii_count = sum(f.count for f in pii_findings if f.severity == "high")
+            sensitive_items_masked += high_pii_count
+            for pf in pii_findings:
+                if pf.severity == "high":
+                    label = _PII_DISPLAY_LABELS.get(pf.pii_type, pf.pii_type)
+                    pii_masked_by_type[label] = pii_masked_by_type.get(label, 0) + pf.count
+
             if self.audit_logger is not None:
                 self.audit_logger.log_chunk_scan(
                     source=source,
@@ -452,12 +529,12 @@ class TrustGateShield:
                     self._log_if_enabled(
                         event_type="pii_chunk_scan",
                         source=source,
-                        location=cloned.metadata.get("location", cloned.chunk_id),
+                        location=cloned.metadata.get("location", source),
                         risk_score=max(65, max_risk),
                         action="masked_high_risk",
                         categories=s_cats,
                         framework_tags=get_framework_tags(s_cats),
-                        reason=f"Secret exposed in chunk: {s_desc}",
+                        reason=f"Secret exposed: {s_desc}",
                         raw_text=chunk.text,
                         file_format=doc_format,
                         finding_type="secret_exposed",
@@ -474,12 +551,12 @@ class TrustGateShield:
                     self._log_if_enabled(
                         event_type="pii_chunk_scan",
                         source=source,
-                        location=cloned.metadata.get("location", cloned.chunk_id),
+                        location=cloned.metadata.get("location", source),
                         risk_score=max(50 if has_high else 25, max_risk),
                         action="masked_high_risk" if has_high else "flagged_contact",
                         categories=l_cats,
                         framework_tags=get_framework_tags(l_cats),
-                        reason=f"PII detected in chunk: {l_desc}",
+                        reason=f"PII detected: {l_desc}",
                         raw_text=chunk.text,
                         file_format=doc_format,
                         finding_type="pii_leak",
@@ -488,9 +565,19 @@ class TrustGateShield:
             sanitized_kept.append(cloned)
 
         total_removed = total_hidden_removed + total_plain_removed
+        if flagged_chunks and total_chars > 0:
+            kept_chars = sum(len(getattr(c, "text", "") or "") for c in sanitized_kept)
+            effective_total = max(total_chars, removed_chars + kept_chars)
+            content_removed_pct = round(min(100.0, (removed_chars / effective_total) * 100), 1)
+            if content_removed_pct == 0.0 and removed_chars > 0:
+                content_removed_pct = 0.1
+            content_kept_pct = round(max(0.0, 100.0 - content_removed_pct), 1)
+        else:
+            content_removed_pct = 0.0
+            content_kept_pct = 100.0
+
         if quarantined_items or total_removed > 0:
             policy_action = "sanitize"
-            kept_label = _plural(len(sanitized_kept), "clean section")
             if total_hidden_removed > 0 and total_plain_removed == 0:
                 removed_label = f"{_plural(total_hidden_removed, 'hidden instruction')} removed"
             elif total_hidden_removed > 0 and total_plain_removed > 0:
@@ -500,10 +587,34 @@ class TrustGateShield:
                 )
             else:
                 removed_label = f"{_plural(max(total_removed, len(quarantined_items)), 'offending instruction')} removed"
-            reason = f"Sanitized: {removed_label}, {kept_label} kept."
+            reason = f"Sanitized: {content_removed_pct:.1f}% of document content removed ({removed_label}), {content_kept_pct:.1f}% kept."
         else:
             policy_action = "allow"
-            reason = "All chunks passed TrustGate Shield checks."
+            reason = "Document passed TrustGate Shield checks."
+
+        masked_label = _plural(sensitive_items_masked, "sensitive item")
+        breakdown_str = _format_pii_breakdown(pii_masked_by_type)
+        masked_part = f"{masked_label} masked ({breakdown_str})" if breakdown_str else f"{masked_label} masked"
+        if content_removed_pct == 0.0:
+            upload_status_line = f"Safe: 100% content kept | {masked_part}"
+        else:
+            upload_status_line = (
+                f"Sanitized: {content_kept_pct:.1f}% content kept "
+                f"({content_removed_pct:.1f}% removed) | {masked_part}"
+            )
+
+        if self.audit_logger is not None:
+            self.audit_logger.log_document_scan(
+                source=source,
+                file_format=doc_format,
+                total_chars=total_chars,
+                removed_chars=removed_chars,
+                removed_pct=content_removed_pct,
+                flagged_pct=flagged_pct,
+                policy_action=policy_action,
+                sensitive_items_masked=sensitive_items_masked,
+                pii_breakdown=pii_masked_by_type,
+            )
 
         return DocumentScanSummary(
             source=source,
@@ -520,6 +631,12 @@ class TrustGateShield:
             reason=reason,
             removed_items_count=max(total_removed, len(quarantined_items)) if quarantined_items else 0,
             removed_texts_summary=removed_snippets,
+            content_removed_pct=content_removed_pct,
+            content_kept_pct=content_kept_pct,
+            flagged_pct=flagged_pct,
+            sensitive_items_masked=sensitive_items_masked,
+            pii_masked_by_type=pii_masked_by_type,
+            upload_status_line=upload_status_line,
         )
 
     def inspect_document(self, text: str, source: str) -> ShieldVerdict:
@@ -710,9 +827,9 @@ class TrustGateShield:
         tags = get_framework_tags(sorted(categories))
         status = "SANITIZED" if flagged_items else "ALLOW"
         reason = (
-            f"Prepared {len(safe_chunks)} chunk(s) with Shield checks ({', '.join(flagged_items)})."
+            "Sensitive items masked before sending to AI."
             if flagged_items
-            else "All retrieved chunks passed Shield checks."
+            else "Retrieved content passed Shield checks."
         )
         return safe_chunks, ShieldVerdict(
             allowed=True,

@@ -11,7 +11,9 @@ import pymupdf
 from bs4 import BeautifulSoup, Comment
 from docx import Document as DocxDocument
 
+from config import get_settings
 from rag.chunker import chunk_document
+from rag.llm import build_llm
 from rag.loader import Document, load_file
 from shield import TrustGateShield, detect_pii, mask_all_pii, mask_high_risk_pii, scan
 
@@ -280,6 +282,10 @@ def _run_pii_benchmark() -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    settings = get_settings()
+    active_llm, _ = build_llm(settings)
+    print(f"Evaluation LLM mode: {settings.llm_mode} ({active_llm.name})")
+
     if not LABELS_CSV.exists():
         raise FileNotFoundError(
             f"Missing {LABELS_CSV}. Run `python scripts/generate_test_suite.py` first."

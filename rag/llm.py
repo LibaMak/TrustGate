@@ -4,15 +4,26 @@ import json
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from groq import Groq
 
+from config import DEFAULT_MODEL
 from rag.retriever import RetrievedChunk
+
+if TYPE_CHECKING:
+    from config import Settings
+
+AI_UNAVAILABLE_MESSAGE = "AI service is not configured / temporarily unavailable."
+
+
+class AIServiceUnavailableError(RuntimeError):
+    """Raised when the configured LLM service cannot be used (no silent fallback)."""
 
 
 def _format_context(context_chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(
-        f"[{item.chunk.source}#chunk-{item.chunk.index} | score={item.score:.2f}]\n{item.chunk.text}"
+        f"[{item.chunk.source} — {(item.chunk.metadata or {}).get('location', 'Document')}]\n{item.chunk.text}"
         for item in context_chunks
     )
 
@@ -57,8 +68,23 @@ class BaseLLM(ABC):
         raise NotImplementedError
 
 
+class UnavailableLLM(BaseLLM):
+    """Explicit placeholder LLM when AI service is missing/unconfigured (never returns fake answers)."""
+
+    def __init__(self, reason: str = AI_UNAVAILABLE_MESSAGE) -> None:
+        self._reason = reason
+
+    @property
+    def name(self) -> str:
+        return "Cloud Groq (Not Configured)"
+
+    def generate(self, query: str, context_chunks: list[RetrievedChunk]) -> str:
+        _ = (query, context_chunks)
+        raise AIServiceUnavailableError(self._reason)
+
+
 class MockLLM(BaseLLM):
-    """Deterministic offline LLM used for smoke testing and keyless local runs."""
+    """Deterministic offline LLM used for smoke testing and evaluation (LLM_MODE=mock)."""
 
     @property
     def name(self) -> str:
@@ -72,17 +98,21 @@ class MockLLM(BaseLLM):
             )
 
         best = context_chunks[0]
-        citations = ", ".join(
-            f"{item.chunk.source}#chunk-{item.chunk.index} (score={item.score:.2f})"
-            for item in context_chunks
-        )
+        seen_sources: list[str] = []
+        for item in context_chunks:
+            loc = (item.chunk.metadata or {}).get("location", "Document")
+            label = f"{item.chunk.source} ({loc})"
+            if label not in seen_sources:
+                seen_sources.append(label)
+        citations = ", ".join(seen_sources)
         snippet = best.chunk.text[:320].strip()
         if len(best.chunk.text) > 320:
             snippet += "..."
 
+        best_loc = (best.chunk.metadata or {}).get("location", "Document")
         return (
             f"[MockLLM] Grounded answer for '{query}':\n\n"
-            f"Top matching context from {best.chunk.source} (chunk {best.chunk.index}):\n"
+            f"Top matching context from {best.chunk.source} ({best_loc}):\n"
             f"\"{snippet}\"\n\n"
             f"Sources consulted: {citations}"
         )
@@ -91,11 +121,9 @@ class MockLLM(BaseLLM):
 class GroqLLM(BaseLLM):
     """Groq-hosted Cloud LLM client."""
 
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b") -> None:
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL) -> None:
         if not api_key or api_key.strip() == "your_groq_api_key_here":
-            raise ValueError(
-                "GROQ_API_KEY is missing. Add it to your local .env file or switch to Mock/Local LLM."
-            )
+            raise ValueError(AI_UNAVAILABLE_MESSAGE)
         self._model = model
         self._client = Groq(api_key=api_key.strip())
 
@@ -163,3 +191,21 @@ class OllamaLLM(BaseLLM):
             body = json.loads(resp.read().decode("utf-8"))
         message = body.get("message") or {}
         return str(message.get("content", "")).strip()
+
+
+def build_llm(settings: Settings) -> tuple[BaseLLM, str | None]:
+    """Select the LLM backend from LLM_MODE (default: cloud) without silently falling back to Mock."""
+    mode = (settings.llm_mode or "cloud").lower()
+    if mode == "mock":
+        return MockLLM(), None
+
+    if mode in {"local", "ollama"}:
+        ok, _ = is_ollama_available(settings.ollama_base_url)
+        if not ok:
+            return UnavailableLLM(AI_UNAVAILABLE_MESSAGE), AI_UNAVAILABLE_MESSAGE
+        return OllamaLLM(model=settings.ollama_model, base_url=settings.ollama_base_url), None
+
+    if not settings.has_groq_key:
+        return UnavailableLLM(AI_UNAVAILABLE_MESSAGE), AI_UNAVAILABLE_MESSAGE
+
+    return GroqLLM(api_key=settings.groq_api_key, model=settings.groq_model), None

@@ -181,7 +181,7 @@ class RAGPipeline:
                 shield_verdicts=verdicts,
                 blocked_response=RAGResponse(
                     query=query,
-                    answer="Blocked by TrustGate Shield: all retrieved chunks were quarantined.",
+                    answer="Blocked by TrustGate Shield: matching document content was removed.",
                     llm_name=self.llm.name,
                     retrieved_chunks=[],
                     shield_verdicts=verdicts,

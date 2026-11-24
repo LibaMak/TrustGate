@@ -38,7 +38,7 @@ def _derive_finding_type(event_type: str, categories: list[str]) -> str:
 
 
 class AuditLogger:
-    """SQLite audit logger storing only masked snippets (never full chunks or raw PII)."""
+    """SQLite audit logger storing only masked snippets (never raw PII or full chunks)."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
@@ -104,6 +104,24 @@ class AuditLogger:
                     risk_score INTEGER NOT NULL,
                     action TEXT NOT NULL,
                     pii_masked_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS document_scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    file_format TEXT NOT NULL,
+                    total_chars INTEGER NOT NULL,
+                    removed_chars INTEGER NOT NULL,
+                    removed_pct REAL NOT NULL,
+                    flagged_pct REAL NOT NULL,
+                    policy_action TEXT NOT NULL,
+                    sensitive_items_masked INTEGER NOT NULL DEFAULT 0,
+                    pii_breakdown TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
@@ -183,6 +201,42 @@ class AuditLogger:
                 ),
             )
 
+    def log_document_scan(
+        self,
+        *,
+        source: str,
+        file_format: str,
+        total_chars: int,
+        removed_chars: int,
+        removed_pct: float,
+        flagged_pct: float,
+        policy_action: str,
+        sensitive_items_masked: int,
+        pii_breakdown: dict[str, int],
+    ) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_scans (
+                    timestamp, source, file_format, total_chars, removed_chars,
+                    removed_pct, flagged_pct, policy_action, sensitive_items_masked, pii_breakdown
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    source,
+                    file_format.upper(),
+                    int(total_chars),
+                    int(removed_chars),
+                    float(removed_pct),
+                    float(flagged_pct),
+                    policy_action,
+                    int(sensitive_items_masked),
+                    json.dumps(pii_breakdown),
+                ),
+            )
+
     def get_recent_findings(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -206,7 +260,7 @@ class AuditLogger:
         return results
 
     def get_dashboard_stats(self) -> dict[str, Any]:
-        """Aggregate metrics, per-type counts, per-format detections, and audit rows from SQLite."""
+        """Aggregate document-level percentages, PII breakdowns, format stats, and findings from SQLite."""
         with self._connect() as conn:
             scan_row = conn.execute(
                 """
@@ -218,6 +272,14 @@ class AuditLogger:
                 FROM chunk_scans
                 """
             ).fetchone()
+
+            doc_rows = conn.execute(
+                """
+                SELECT source, file_format, total_chars, removed_chars, removed_pct,
+                       flagged_pct, policy_action, sensitive_items_masked, pii_breakdown
+                FROM document_scans
+                """
+            ).fetchall()
 
             output_pii_row = conn.execute(
                 """
@@ -240,18 +302,6 @@ class AuditLogger:
                 SELECT finding_type, COUNT(*) AS cnt
                 FROM shield_findings
                 GROUP BY finding_type
-                """
-            ).fetchall()
-
-            format_scan_rows = conn.execute(
-                """
-                SELECT
-                    file_format,
-                    COUNT(*) AS chunks_scanned,
-                    SUM(CASE WHEN action = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-                    SUM(CASE WHEN action = 'allowed' THEN 1 ELSE 0 END) AS allowed
-                FROM chunk_scans
-                GROUP BY file_format
                 """
             ).fetchall()
 
@@ -279,27 +329,70 @@ class AuditLogger:
             findings_by_type[ft] = int(r["cnt"])
 
         findings_per_format = {r["file_format"]: int(r["detections"]) for r in format_finding_rows}
-        scans_per_format = {
-            r["file_format"]: {
-                "chunks_scanned": int(r["chunks_scanned"] or 0),
-                "blocked": int(r["blocked"] or 0),
-                "allowed": int(r["allowed"] or 0),
-            }
-            for r in format_scan_rows
-        }
 
-        format_table: list[dict[str, Any]] = []
+        total_doc_chars = 0
+        total_removed_chars = 0
+        doc_pii_total = 0
+        pii_masked_by_type: dict[str, int] = {}
+        fmt_docs: dict[str, dict[str, Any]] = {}
+
+        for dr in doc_rows:
+            t_chars = int(dr["total_chars"] or 0)
+            r_chars = int(dr["removed_chars"] or 0)
+            masked_cnt = int(dr["sensitive_items_masked"] or 0)
+            fmt = str(dr["file_format"] or "TXT").upper()
+
+            total_doc_chars += t_chars
+            total_removed_chars += r_chars
+            doc_pii_total += masked_cnt
+
+            breakdown = json.loads(dr["pii_breakdown"] or "{}")
+            for k, v in breakdown.items():
+                pii_masked_by_type[k] = pii_masked_by_type.get(k, 0) + int(v)
+
+            entry = fmt_docs.setdefault(
+                fmt,
+                {"docs": 0, "total_chars": 0, "removed_chars": 0, "masked": 0},
+            )
+            entry["docs"] += 1
+            entry["total_chars"] += t_chars
+            entry["removed_chars"] += r_chars
+            entry["masked"] += masked_cnt
+
+        if doc_rows and total_doc_chars > 0:
+            content_removed_pct = round(min(100.0, (total_removed_chars / total_doc_chars) * 100), 1)
+            content_kept_pct = round(max(0.0, 100.0 - content_removed_pct), 1)
+        else:
+            content_removed_pct = 0.0
+            content_kept_pct = 100.0 if doc_rows else 0.0
+
+        format_metrics_table: list[dict[str, Any]] = []
         for fmt in ("PDF", "DOCX", "URL", "TXT"):
-            scan_info = scans_per_format.get(fmt, {"chunks_scanned": 0, "blocked": 0, "allowed": 0})
-            format_table.append(
+            info = fmt_docs.get(fmt, {"docs": 0, "total_chars": 0, "removed_chars": 0, "masked": 0})
+            fmt_removed_pct = (
+                round(min(100.0, (info["removed_chars"] / info["total_chars"]) * 100), 1)
+                if info["total_chars"] > 0
+                else 0.0
+            )
+            format_metrics_table.append(
                 {
                     "File Format": fmt,
-                    "Chunks Scanned": scan_info["chunks_scanned"],
-                    "Blocked": scan_info["blocked"],
-                    "Allowed": scan_info["allowed"],
+                    "Documents": info["docs"],
+                    "Content Removed (%)": fmt_removed_pct,
+                    "Sensitive Items Masked": info["masked"],
                     "Detections": findings_per_format.get(fmt, 0),
                 }
             )
+
+        total_pii_types = sum(pii_masked_by_type.values())
+        pii_share_table: list[dict[str, Any]] = [
+            {
+                "Sensitive Type": ptype,
+                "Count": cnt,
+                "Share (%)": round((cnt / total_pii_types) * 100, 1) if total_pii_types else 0.0,
+            }
+            for ptype, cnt in sorted(pii_masked_by_type.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
 
         all_findings: list[dict[str, Any]] = []
         for row in finding_rows:
@@ -308,18 +401,26 @@ class AuditLogger:
             item["framework_tags"] = json.loads(item["framework_tags"])
             all_findings.append(item)
 
-        chunk_pii = int((scan_row["chunk_pii_masked"] if scan_row else 0) or 0)
         out_pii = int((output_pii_row["output_pii_masked"] if output_pii_row else 0) or 0)
+        chunk_pii = int((scan_row["chunk_pii_masked"] if scan_row else 0) or 0)
+        total_sensitive_masked = (doc_pii_total if doc_rows else chunk_pii) + out_pii
 
         return {
+            "documents_scanned": len(doc_rows),
+            "content_removed_pct": content_removed_pct,
+            "content_kept_pct": content_kept_pct,
+            "sensitive_items_masked": total_sensitive_masked,
+            "pii_masked_by_type": pii_masked_by_type,
+            "pii_share_table": pii_share_table,
+            "sensitive_queries_flagged": int((query_flag_row["cnt"] if query_flag_row else 0) or 0),
+            "findings_by_type": findings_by_type,
+            "format_table": format_metrics_table,
+            "all_findings": all_findings,
+            # Legacy keys kept for non-UI tests
             "total_chunks_scanned": int((scan_row["total_chunks"] if scan_row else 0) or 0),
             "blocked_chunks": int((scan_row["blocked_chunks"] if scan_row else 0) or 0),
             "allowed_chunks": int((scan_row["allowed_chunks"] if scan_row else 0) or 0),
-            "pii_items_masked": chunk_pii + out_pii,
-            "sensitive_queries_flagged": int((query_flag_row["cnt"] if query_flag_row else 0) or 0),
-            "findings_by_type": findings_by_type,
-            "format_table": format_table,
-            "all_findings": all_findings,
+            "pii_items_masked": total_sensitive_masked,
         }
 
     def get_logged_sources(self) -> list[str]:
@@ -327,6 +428,8 @@ class AuditLogger:
             rows = conn.execute(
                 """
                 SELECT DISTINCT source FROM (
+                    SELECT source FROM document_scans
+                    UNION
                     SELECT source FROM chunk_scans
                     UNION
                     SELECT source FROM shield_findings
@@ -341,6 +444,7 @@ class AuditLogger:
         with self._connect() as conn:
             conn.execute("DELETE FROM shield_findings WHERE source = ?", (source,))
             conn.execute("DELETE FROM chunk_scans WHERE source = ?", (source,))
+            conn.execute("DELETE FROM document_scans WHERE source = ?", (source,))
 
     def count(self) -> int:
         with self._connect() as conn:
@@ -351,3 +455,4 @@ class AuditLogger:
         with self._connect() as conn:
             conn.execute("DELETE FROM shield_findings")
             conn.execute("DELETE FROM chunk_scans")
+            conn.execute("DELETE FROM document_scans")

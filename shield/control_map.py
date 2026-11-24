@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+CLAUSE_URLS: dict[str, str] = {
+    "LLM01": "https://genai.owasp.org/llmrisk/llm01-prompt-injection/",
+    "LLM02": "https://genai.owasp.org/llmrisk/llm022025-sensitive-information-disclosure/",
+    "LLM08": "https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/",
+    "NIST_AI_RMF": "https://www.nist.gov/itl/ai-risk-management-framework",
+    "NIST_CSF": "https://www.nist.gov/cyberframework",
+}
+
 CONTROL_MAP: dict[str, dict[str, str]] = {
     "prompt_injection": {
         "OWASP": "LLM01:2025 Prompt Injection",
@@ -44,6 +52,19 @@ CONTROL_MAP: dict[str, dict[str, str]] = {
         "NIST_CSF": "RS.MI-01 / PR.DS-02",
     },
 }
+
+
+def risk_level_from_score(score: float | int) -> str:
+    val = float(score)
+    if val >= 90:
+        return "Critical"
+    if val >= 70:
+        return "High"
+    if val >= 40:
+        return "Medium"
+    if val > 0:
+        return "Low"
+    return "None"
 
 
 def get_framework_tags(categories: Iterable[str]) -> list[str]:
@@ -106,3 +127,69 @@ def extract_control_breakdowns(
         "nist_csf": sorted(nist_csf),
         "owasp": sorted(owasp),
     }
+
+
+def get_clause_links(
+    categories: Iterable[str] = (),
+    framework_tags: Iterable[str] = (),
+) -> list[tuple[str, str]]:
+    """Return clickable (label, url) pairs for OWASP, NIST AI RMF, and NIST CSF clauses."""
+    tags = list(framework_tags) if framework_tags else get_framework_tags(categories)
+    links: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for tag in tags:
+        if tag.startswith("OWASP:"):
+            body = tag.split(":", 1)[1].strip()
+            url = CLAUSE_URLS["LLM01"]
+            for oid in ("LLM01", "LLM02", "LLM08"):
+                if oid in body:
+                    url = CLAUSE_URLS[oid]
+                    break
+            label = f"OWASP {body.split(':')[0] if ':' in body else body}"
+            if label not in seen:
+                seen.add(label)
+                links.append((label, url))
+        elif tag.startswith("NIST AI RMF:"):
+            label = tag
+            if label not in seen:
+                seen.add(label)
+                links.append((label, CLAUSE_URLS["NIST_AI_RMF"]))
+        elif tag.startswith("NIST CSF:"):
+            label = tag
+            if label not in seen:
+                seen.add(label)
+                links.append((label, CLAUSE_URLS["NIST_CSF"]))
+
+    return links
+
+
+def format_clause_links_md(
+    categories: Iterable[str] = (),
+    framework_tags: Iterable[str] = (),
+) -> str:
+    links = get_clause_links(categories=categories, framework_tags=framework_tags)
+    if not links:
+        return "None"
+    return " · ".join(f"[{label}]({url})" for label, url in links)
+
+
+def format_clause_links_plain(
+    categories: Iterable[str] = (),
+    framework_tags: Iterable[str] = (),
+) -> str:
+    links = get_clause_links(categories=categories, framework_tags=framework_tags)
+    if not links:
+        return "None"
+    return " | ".join(f"{label} ({url})" for label, url in links)
+
+
+def format_clause_codes(
+    categories: Iterable[str] = (),
+    framework_tags: Iterable[str] = (),
+) -> str:
+    """Return concise non-URL framework codes for tables and compact audit rows."""
+    links = get_clause_links(categories=categories, framework_tags=framework_tags)
+    if not links:
+        return "None"
+    return " · ".join(label for label, _ in links)
